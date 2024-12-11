@@ -1,0 +1,365 @@
+---
+title: "Predicting Shopping Habits in E-Commerce"
+author: "James Spalding"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, message = F, warning = F, include = F)
+```
+
+```{r}
+library(tidyverse)
+library(MASS)
+library(corrplot)
+library(mltools)
+library(data.table)
+library(caret)
+library(glmnet)
+select = dplyr::select
+```
+
+```{r}
+#make categories factors
+data = read.csv('online_shoppers_intention.csv')
+data$Weekend = as.numeric(data$Weekend)
+data$Revenue = as.numeric(data$Revenue)
+data$VisitorType = factor(data$VisitorType)
+data$OperatingSystems = factor(data$OperatingSystems)
+data$Browser = factor(data$Browser)
+data$Region = factor(data$Region)
+data$TrafficType = factor(data$TrafficType)
+data$Month = factor(data$Month, levels = c("Feb", "Mar", "May", "June", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")) #april missing?
+
+numeric_data = one_hot(as.data.table(data))
+
+#split data
+set.seed(543)
+tr_samp = sample(c(T, F), nrow(numeric_data), replace=TRUE, prob=c(0.7,0.3))
+train_1 = numeric_data[tr_samp,]
+test_1 = numeric_data[!tr_samp,]
+```
+
+# Introduction
+
+In the past decade, online shopping has changed the way businesses make money. It is a multi-trillion dollar business, and having a strong e-commerce front has been the make-or-break factor as to whether new businesses will take off and whether old businesses will survive. 
+
+Knowing what guides a shopper's intent is extremely valuable information for businesses, as it can help them make decisions which can dramatically increase their sales. In this report, we will attempt to create a model that can accurately predict whether an online shopper will purchase a product based off their interactions with a company's e-commerce website.
+
+The dataset used for this paper consists of feature vectors belonging to 12,330 users of an e-commerce website, with each observation belonging to a separate user as to avoid any sort of bias. The features recorded relate to the number of pages viewed by type, the amount of time spent on said pages, the "value" of a page, the month and whether a holiday is near, various metrics relating to how and where the user accessed the website from, and whether the user's session ended with a transaction.
+
+Our target value for prediction is the binary value of whether a transaction was made, so the natural choice of model would be **logistic regression**; the odds of an event happening given a set of independent predictors. Unlike linear regression, logistic regression does not assume a linear relationship, normally distributed error terms, or equal variance. It does, however, assume independent observations, no multicolinearity, and no extreme outliers.
+
+To evaluate the models, Cohen's $\kappa$ statistic will be used. $\kappa$ is a nonparametric test to measure agreement between predictions made by the model and true values. The value of $\kappa$ ranges from -1 to 1, with $\kappa=0$ being the amount of agreement expected by chance, and $|\kappa| = 1$ being perfect agreement. The interpretations are shown in the table below:
+
+| $\kappa$ | Agreement     |
+|----------|---------------|
+| < 0.2    | None          |
+| < 0.4    | Minimal/Fair  |
+| < 0.6    | Moderate/Weak |
+| < 0.8    | Substantial   |
+| > 0.9    | Near Perfect  |
+
+# Initial Model
+
+Ignoring the previous assumptions, let's check a model fit immediately using the data as-is (all variables will be included). Before fitting, the data is split into training and testing subsets with 70% and 30% of observations, respectively. The results of the base model are shown below:
+
+|**Model 1**| Precision | Recall |
+|-------|-----------|--------|
+| False | 0.89      | 0.98   |
+| True  | 0.73      | 0.36   |
+|-------|-----------|--------|
+|       | Accuracy  | 0.88   |
+
+At first glance, the model may look good already with an accuracy of 88%. This metric, however, is misleading. The values of our response value are very imbalanced, with only 1,908 of the 12,330 sessions ending in a transaction. While the model did quite well at predicting the customers that did *not* buy anything, it struggles at predicting the ones that actually will. This is shown by the recall being only 0.36 for true cases, meaning that the model only correctly labels 36% of cases where customers made a purchase. Furthermore, this model's $\kappa$ value is 0.42, which indicates minimal to fair agreement.
+
+```{r}
+#function to test models throughout project
+test_mod = function(data, mod, thresh=.5){
+  y_test_1 = data$Revenue
+  x_test_1 = data %>% select(-Revenue)
+  
+  y_probs = predict(mod, x_test_1, type='response')
+  
+  predicted_values = ifelse(y_probs>=thresh,1,0)
+  conf_matrix = table(predicted_values,y_test_1)
+  
+  print(confusionMatrix(conf_matrix))
+}
+
+
+init_mod = glm(Revenue~., data=train_1, family='binomial')
+test_mod(test_1,init_mod)
+```
+
+# Model Tuning
+
+**Data Transformation**
+
+The distribution of values in all of the predictors are extremely skewed, with skewness values close to or greater than 1; meaning there are outliers in each and every one of them. To account for this, the Box Cox procedure was used to approximate the normal distribution for all predictors, which were then standardized with mean 0 and standard deviation 1.
+
+Using this data, we will fit a model with the same training data, just transformed. It is also fit with the same features as the initial model, so the only difference is the transformations. The results are shown below:
+
+```{r}
+#all numeric are right skewed
+
+# hist(numeric_data$Administrative)
+# hist(numeric_data$Administrative_Duration)
+# hist(numeric_data$Informational)
+# hist(numeric_data$Informational_Duration)
+# hist(numeric_data$ProductRelated)
+# hist(numeric_data$ProductRelated_Duration)
+# hist(numeric_data$BounceRates)
+# hist(numeric_data$ExitRates)
+# hist(numeric_data$PageValues)
+# hist(numeric_data$SpecialDay)
+# hist(numeric_data$OperatingSystems)
+# hist(numeric_data$Browser)
+# hist(numeric_data$Region)
+# hist(numeric_data$TrafficType)
+# 
+# for(col in colnames(numeric_data)){
+#   print(col)
+#   print(skewness(numeric_data[[col]]))
+# }
+```
+
+```{r}
+boxcox_transform = function(column){
+  boxcox_obj = boxcox(column ~ 1, plotit = FALSE)
+  lambda = boxcox_obj$x[which.max(boxcox_obj$y)]
+  
+  if (lambda == 0) {
+    return(log(column))
+  } else {
+    return((column^lambda - 1) / lambda)
+  }
+}
+
+#get transformed and standardized data
+categories = data %>% select(c(Revenue, Weekend, VisitorType, OperatingSystems,
+                               Browser, Region, TrafficType, Month))
+
+cat_1h = one_hot(as.data.table(categories))
+
+nums = data %>% select(-c(Revenue, Weekend, VisitorType, OperatingSystems,
+                          Browser, Region, TrafficType, Month))
+
+numeric_bc = as.data.frame(lapply(nums + .0000000001, boxcox_transform))
+numeric_stand = as.data.frame(scale(numeric_bc))
+
+transformed_data = cbind(cat_1h, numeric_stand)
+```
+
+```{r}
+train_2 = transformed_data[tr_samp,] #note: using same cases as initial model
+test_2 = transformed_data[!tr_samp,]
+
+mod_2 = glm(Revenue~., data=train_2, family='binomial')
+
+test_mod(test_2,mod_2)
+```
+
+|**Model 2**| Precision | Recall |
+|-------|-----------|--------|
+| False | 0.92      | 0.96   |
+| True  | 0.70      | 0.59   |
+|-------|-----------|--------|
+|       | Accuracy  | 0.90   |
+
+This model is a huge improvement from the initial model, with the recall issue being fixed without the accuracy taking a hit. The $\kappa$ value is also 0.58, which indicates moderate agreement, approaching substantial agreement.
+
+While the previous model is very good, and could be considered "good enough," there are still a few more steps that can be taken to obtain the best possible predictions.
+
+**Feature Selection**
+
+The first step that can be taken is to perform feature selection to eliminate redundant variables and get an overall more accurate model. There are many ways to approach feature selection, but in this paper we will use elastic net selection.
+
+The elastic net formula is very flexible, having different parameters which can be tweaked to improve the accuracy of the model. We will be looking at 3 different elastic net models: when $\alpha=0$ (ridge regression), $\alpha=1$ (LASSO regression), and the $\alpha$ value which maximizes $\kappa$.
+
+The best $\lambda$ parameter was found for each model via 10-fold cross validation and then fit. The $\kappa$ scores found for the 3 models, along with 18 others that will not be discussed, are shown in the plot below:
+
+```{r}
+#data to use for feature selection
+y = train_2$Revenue
+x = train_2 %>% select(-Revenue)
+x = as.matrix(x)
+
+new = test_2 %>% select(-Revenue)
+new = as.matrix(new)
+```
+
+```{r}
+# find best alpha
+alphas_out = c(); kappas_out = c() #for visual
+
+alphas = seq(0, 1, by = 0.05)
+for(a in alphas){
+  lasso_mod = cv.glmnet(x, y, alpha = a) #10 folds
+  best_lambda = lasso_mod$lambda.min
+  best_model = glmnet(x, y, alpha = a, lambda = best_lambda)
+  
+  probs = predict(best_model, s = best_lambda, newx = new, type='response')
+  preds = ifelse(probs >= 0.5, 1, 0)
+  conf_matrix = table(preds,test_2$Revenue)
+  alphas_out = c(alphas_out,a); kappas_out = c(kappas_out,kappa(conf_matrix)$coef) 
+
+  #cat('\nAlpha =', a, 'kappa =', kappa(conf_matrix)$coef)
+}
+```
+
+```{r, include=T, fig.dim = c(6, 4)}
+elastic_params = data.frame(alphas = alphas_out, kappas = kappas_out)
+
+ggplot(elastic_params, aes(alphas, kappas))+
+  geom_line()+
+  coord_cartesian(xlim = c(0, 1), ylim = c(0.6, 0.62)) +
+  scale_x_continuous(breaks = seq(0, 1, by = 0.1))+
+  labs(x = 'Alpha', y = 'Kappa Score', title = 'Optimal Alpha Value')+
+  theme_minimal()
+```
+
+
+```{r}
+#ridge
+ridge_mod = cv.glmnet(x, y, alpha = 0)
+best_lambda = ridge_mod$lambda.min
+best_model = glmnet(x, y, alpha = 0, lambda = best_lambda)
+
+probs = predict(best_model, s = best_lambda, newx = new, type='response')
+preds = ifelse(probs >= 0.5, 1, 0)
+conf_matrix = table(preds,test_2$Revenue)
+
+confusionMatrix(conf_matrix)
+#.94, .68, .95, .64, k=.599
+```
+
+```{r}
+#lasso
+lasso_mod = cv.glmnet(x, y, alpha = 1)
+best_lambda = lasso_mod$lambda.min
+best_model = glmnet(x, y, alpha = 1, lambda = best_lambda)
+
+probs = predict(best_model, s = best_lambda, newx = new, type='response')
+preds = ifelse(probs >= 0.5, 1, 0)
+conf_matrix = table(preds,test_2$Revenue)
+
+confusionMatrix(conf_matrix)
+#.95, .65, .93, .71, k=.614
+```
+
+```{r}
+#best k
+best_elas = cv.glmnet(x, y, alpha = .8)
+best_lambda = best_elas$lambda.min
+best_model = glmnet(x, y, alpha = .8, lambda = best_lambda)
+
+probs = predict(best_model, s = best_lambda, newx = new, type='response')
+preds = ifelse(probs >= 0.5, 1, 0)
+conf_matrix = table(preds,test_2$Revenue)
+
+confusionMatrix(conf_matrix)
+# .95, .65, .93, .71, .619
+```
+
+|                 | Base | Ridge | LASSO | $\alpha = 0.8$ |
+|-----------------|------|-------|-------|----------------|
+| True Precision  | 0.70 | 0.68  | 0.65  | 0.65           |
+| True Recall     | 0.59 | 0.64  | 0.71  | 0.71           |
+| False Precision | 0.92 | 0.94  | 0.95  | 0.95           |
+| False Recall    | 0.96 | 0.95  | 0.93  | 0.93           |
+| $\kappa$        | 0.581| 0.599 | 0.614 | 0.619          |
+
+Note that while the precision for true values is slightly worse on all of the new models compared to the base model, the recall is significantly higher, meaning there are more overall correct predictions.
+
+Also note that, while the LASSO and optimal models have the same performance at the 100ths place, they are not identical and the optimal model will be used for the rest of the paper.
+
+**Threshold Optimization**
+
+Finally, the model can be tweaked in one more way in order to get the most accurate predictions possible. When the model makes a prediction, it gives a probability. By default (and for all previous models), the model returns True when the predicted probability is above 0.5. However, we can raise or lower this threshold to any value between the minimum and maximum predicted probabilities, in this case -0.32 and 0.86, to get better results.
+
+```{r}
+# find best threshold for optimal model
+test_mod = cv.glmnet(x, y, alpha = .8)
+best_lambda = test_mod$lambda.min
+optimal_model = glmnet(x, y, alpha = .8, lambda = best_lambda)
+
+thresh_out = c(); kappas_out = c()
+threshs = seq(-.32, .86, by = 0.01) #0 after .82
+for(t in threshs){
+  probs = predict(optimal_model, s = best_lambda, newx = new, type='response')
+  preds = ifelse(probs >= t, 1, 0)
+  conf_matrix = table(preds,test_2$Revenue)
+  
+  if(all(dim(conf_matrix) == 2)){
+    kappa_value = kappa(conf_matrix)$coef
+  } else {
+    kappa_value = 0
+  }
+  
+  thresh_out = c(thresh_out, t)
+  kappas_out = c(kappas_out, kappa_value)
+
+  #cat('\nThresh =', t, 'kappa =', kappa_value)
+}
+```
+
+```{r, include=T, fig.dim = c(6, 4)}
+thresh_params = data.frame(thresholds = thresh_out, kappas = kappas_out)
+
+ggplot(thresh_params, aes(thresholds, kappas))+
+  geom_line()+
+  coord_cartesian(xlim = c(-.32, .86), ylim = c(0, 0.65)) +
+  labs(x = 'Threshold', y = 'Kappa Score', title = 'Optimal Threshold')+
+  theme_minimal()
+```
+
+Unfortunately, the optimal threshold in this case is still 0.5. Therefore, the final model will still be the elastic net with $\alpha = 0.8$. 
+
+# Final Model
+
+```{r}
+coef(optimal_model)
+```
+
+**Coefficients**
+
+Now that a final model is chosen, a few observations can be made about the coefficients. The SpecialDay coefficient, indicating how close a given date is to a holiday, was surprisingly dropped from the model; along with weekend. 
+
+One of the largest positive coefficients is, unsurprisingly, the PageValue coefficient with the odds increasing by a factor of 1.24 as a page's value increases by 1. This was expected as a page that is higher value is already expected to draw in more customers. *The* largest coefficient is TrafficType_16, as those who fall in this category have an odds of completing a transaction 1.37 times that of those in the baseline group (TrafficType_1). Furthermore, those using Browser_12 have an odds of making a purchase 1.22 times that of than those using Browser_1.                     
+
+The largest negative coefficient is OperatingSystems_6, with an odds of purchase 0.85 times that of a user in OperatingSystems_1. The other negative coefficients were mostly negligible, and are too small to make a worthwhile interpretation.
+
+**Predictions**
+
+```{r}
+probs = predict(optimal_model, s = best_lambda, newx = new, type='response')
+preds = ifelse(probs >= .5, 1, 0)
+conf_matrix = table(preds,test_2$Revenue)
+```
+
+|                 | False | True |
+|-----------------|-------|------|
+| Predicted False | 2917  | 168  |
+| Predicted True  | 213   | 396  |
+
+The confusion matrix of the final model shows that when the model decides that a user is *not* going to make a purchase, it is right over 17 times more often than it is wrong. When it decides that a user *is* going to make a purchase, it is right nearly twice as often as it is wrong.
+
+# Conclusion
+
+Using the results of our model, a few business decisions could be made by the company running the website:
+
+* Spend less money on holiday promotions
+
+* Improve efficiency in routing people to high-value pages
+
+* Either cater to the niche of TrafficType_16 and Browser_12, or divert resources to attract more customers with different TrafficTypes and Browsers
+
+* Market more towards users of OperatingSystem_6
+
+In conclusion, logistic regression is a very powerful tool to make predictions and gain insights on problems too advanced for humans. While it can be useful quickly, its full potential is unlocked by tweaking its hyperparameters and adjusting the data to work well within it.
+
+
